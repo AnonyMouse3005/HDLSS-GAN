@@ -200,13 +200,16 @@ class CTGAN(BaseSynthesizer):
         verbose (boolean):
             Whether to have print statements for progress results. Defaults to ``False``.
         epochs (int):
-            Number of training epochs. Defaults to 300.
+            Number of training epochs. Defaults to 100.
         pac (int):
             Number of samples to group together when applying the discriminator.
-            Defaults to 10.
-        pad (int):
+            Defaults to 3.
+        q (int):
             Factor for multiplying to batch size when sampling conditional vectors.
-            Defaults to 1.
+            Defaults to 20.
+        omega (float):
+            Ratio of conditions in condvec dedicated for the target variable.
+            Defaults to 0.5.
         cuda (bool):
             Whether to attempt to use cuda for GPU computation.
             If this is False or CUDA is not available, CPU will be used.
@@ -216,9 +219,9 @@ class CTGAN(BaseSynthesizer):
     def __init__(self, embedding_dim=128, generator_dim=(256, 256), discriminator_dim=(256, 256), classifier_dim=(256, 256),
                  generator_lr=2e-4, generator_decay=1e-6, discriminator_lr=2e-4,
                  discriminator_decay=1e-6, classifier_lr=2e-4, classifier_decay=1e-6,
-                 batch_size=500, discriminator_steps=1,
-                 log_frequency=True, verbose=False, epochs=300, pac=10, cuda=True,
-                 pad=10, sk=False, wpfs=False, wpn_layers=(256, 256, 256, 256), smart_cond=False):
+                 batch_size=30, discriminator_steps=1,
+                 log_frequency=True, verbose=False, epochs=100, pac=3, cuda=True,
+                 q=20, sk=False, wpfs=False, wpn_layers=(256, 256, 256, 256), smart_cond=False, omega=0.5):
 
         assert batch_size % 2 == 0
 
@@ -240,12 +243,13 @@ class CTGAN(BaseSynthesizer):
         self._verbose = verbose
         self._epochs = epochs
         self.pac = pac
-        self.pad = pad
+        self.q = q
         self.sk = sk
         self.wpfs = wpfs
         if self.wpfs:
             self.wpn_layers = wpn_layers
         self.smart_cond = smart_cond
+        self.omega = omega
 
         if not cuda or not torch.cuda.is_available():
             device = 'cpu'
@@ -332,9 +336,7 @@ class CTGAN(BaseSynthesizer):
                     st = ed
                     st_c = ed_c
 
-        # print(loss[0].size())  # loss: list of '#discrete_raw_columns' elements, each is an array contains 'batch' values
         loss = torch.stack(loss, dim=1)  # noqa: PD013
-        # print(loss.size())  # (batch, #discrete_raw_columns)
 
         return (loss * m).sum() / data.size()[0]  # average over all samples in batch
 
@@ -403,7 +405,7 @@ class CTGAN(BaseSynthesizer):
         return auroc
 
     @random_state
-    def fit(self, trial, train_data, discrete_columns=(), epochs=None, task=None, return_loss=False, validate=None):
+    def fit(self, trial, train_data, discrete_columns=(), epochs=None, task=None, return_loss=False):
         """Fit the CTGAN Synthesizer models to the training data.
 
         Args:
@@ -417,8 +419,6 @@ class CTGAN(BaseSynthesizer):
             task (dict):
                 Dictionary containing {problem_type: target_column},
                 where problem_type in ['Classification', ]
-            validate (None or dict):
-                Dictionary with format dict(clf=, valid_data=pandas.DataFrame, prune=bool)
         """
         self._validate_discrete_columns(train_data, discrete_columns)
 
@@ -440,7 +440,6 @@ class CTGAN(BaseSynthesizer):
         self._transformer.fit(train_data, discrete_columns)
 
         train_data, transformed_column_names = self._transformer.transform(train_data)
-        # pd.DataFrame(train_data, columns=transformed_column_names).to_csv('X_transformed.csv', index=False)
         discrete_col_idxs, transformed_discrete_columns = [], []
         for idx, c in enumerate(transformed_column_names):
             if c.startswith(tuple(discrete_columns)):
@@ -452,7 +451,6 @@ class CTGAN(BaseSynthesizer):
             self._transformer.output_info_list,
             self._log_frequency,
             transformed_discrete_columns)
-        # print(len(self._transformer.output_info_list))  # equal number of raw columns in train_data
 
         data_dim = self._transformer.output_dimensions  # number of transformed columns (only beta for continuous columns)
 
@@ -492,8 +490,8 @@ class CTGAN(BaseSynthesizer):
                     self._classifier_dim,
                     embedding_matrix
                 )
-                n_target_cond = 5
-                self.col_idxs = np.random.choice(np.arange(len(transformed_discrete_columns)), self._batch_size-n_target_cond) if self.smart_cond else None
+                other_cond_size = round((1-self.omega)*self._batch_size)
+                self.col_idxs = np.random.choice(np.arange(len(transformed_discrete_columns)), other_cond_size) if self.smart_cond else None
             else:
                 first_layer = None
                 self.col_idxs = None
@@ -522,7 +520,6 @@ class CTGAN(BaseSynthesizer):
 
         steps_per_epoch = max(len(train_data) // self._batch_size, 1)
         for i in epoch_iterator:
-            # if i%10==0:     print(f'{i+1}/{epochs}')
             for id_ in range(steps_per_epoch):
 
                 for n in range(self._discriminator_steps):
@@ -568,10 +565,10 @@ class CTGAN(BaseSynthesizer):
                     loss_d.backward()
                     optimizerD.step()
 
-                mean_padded = torch.zeros(self._batch_size*self.pad, self._embedding_dim, device=self._device)
+                mean_padded = torch.zeros(self._batch_size*self.q, self._embedding_dim, device=self._device)
                 std_padded = mean_padded + 1
                 fakez = torch.normal(mean=mean_padded, std=std_padded)
-                condvec = self._data_sampler.sample_condvec(self._batch_size*self.pad, pad=self.pad, sk=self.sk, col_idxs=self.col_idxs)
+                condvec = self._data_sampler.sample_condvec(self._batch_size*self.q, q=self.q, sk=self.sk, col_idxs=self.col_idxs)
 
                 if condvec is None:
                     c1, m1, col, opt = None, None, None, None
@@ -601,24 +598,16 @@ class CTGAN(BaseSynthesizer):
                 optimizerG.step()
 
                 if task:
-                    # fake = self._generator(fakez)
-                    # fake = self._generator(fakez[torch.randperm(len(fakez))[:self._batch_size]])  # NOTE: for classifier, padding is not necessary
                     fake = self._generator(fakez[cond_target, :])
                     fakeact = self._apply_activate(fake)
 
                     real_pred, real_label, sparsity_weights = classifier(real)
-                    fake_pred, fake_label, sparsity_weights2 = classifier(fakeact)
+                    fake_pred, fake_label, _ = classifier(fakeact)
                     if sparsity_weights is not None:
-                        _, col_idxs = sparsity_weights[discrete_feature_idxs].topk(self._batch_size-n_target_cond)  # k must be <= batch
-                        _, col_idxs2 = sparsity_weights2[discrete_feature_idxs].topk(self._batch_size-n_target_cond)  # k must be <= batch
+                        importances = sparsity_weights[discrete_feature_idxs]
+                        col_idxs = np.random.choice(np.arange(importances.size(dim=0)), size=other_cond_size, p=importances/importances.sum())
                         if self.smart_cond:
                             self.col_idxs = col_idxs.numpy()
-                        if id_ in [0, steps_per_epoch-1]:
-                            columns = [c.split('_')[0] for c in np.array(transformed_discrete_columns)[col_idxs]]
-                            columns2 = [c.split('_')[0] for c in np.array(transformed_discrete_columns)[col_idxs2]]
-                            print(f'Epoch {i+1}/{self._epochs}: {len(set(columns2).difference(set(columns)))}')
-                            print(fake.size())
-                            # print(f'columns (real) {" ".join(c for c in columns)}\ncolumns (fake) {" ".join(c for c in columns2)}\n')
 
                     if (st_ed[1]-st_ed[0]) > 2:  # multiclass classification
                         c_loss = CrossEntropyLoss()
@@ -637,20 +626,6 @@ class CTGAN(BaseSynthesizer):
                     optimizerC.zero_grad()
                     loss_cc.backward()
                     optimizerC.step()
-
-            if validate is not None:
-                classes_count = raw_data[target].value_counts().sort_index()
-                with torch.no_grad():
-                    synthetic_data = self.conditional_sample(target, classes_count)
-
-                auroc = self.evaluate_downstream_pred(validate['clf'], raw_data, synthetic_data, validate['valid_data'], target)
-
-                if validate['prune']:
-                    # For pruning (stops trial early if not promising)
-                    trial.report(auroc, i)
-                    # Handle pruning based on the intermediate value.
-                    if trial.should_prune():
-                        raise optuna.exceptions.TrialPruned()
 
             generator_loss = loss_g.detach().cpu()
             cross_entropy_loss = cross_entropy.detach().cpu()
@@ -683,8 +658,6 @@ class CTGAN(BaseSynthesizer):
 
         if return_loss:
             return self.loss_values
-        if validate:
-            return auroc
 
     @random_state
     def sample(self, n, condition_column=None, condition_value=None):

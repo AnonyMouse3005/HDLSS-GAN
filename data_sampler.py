@@ -97,6 +97,10 @@ class DataSampler(object):
         return np.array(discrete_column_id), col_idxs - self._discrete_column_cond_st[discrete_column_id]
 
     def enforce_skip_constraints(self, batch, cond, mask, discrete_column_id, category_id_in_col):
+        """
+        NOTE: this is demo for enforcing ONE skip constraint.
+        Implementation for enforcing all skip constraints cannot be publicly released yet due to data sharing restrictions.
+        """
         sk_mask = np.zeros(self._n_discrete_columns)
         constrained_columns = [f'ID{j}' for j in [1,3,4,5,6,7,8,9,10,11,15,16,17,18,19,20]]
         sk_idx = [idx for idx, c in enumerate(self.discrete_columns) if c in constrained_columns]
@@ -117,7 +121,7 @@ class DataSampler(object):
 
         return cond, mask
 
-    def sample_condvec(self, batch, pad=1, sk=False, col_idxs=None):
+    def sample_condvec(self, batch, q=1, sk=False, col_idxs=None):
         """Generate the conditional vector for training.
 
         Returns:
@@ -139,22 +143,13 @@ class DataSampler(object):
         target_id = self._n_discrete_columns - 1
         if col_idxs is not None:
             col_idxs = np.append(col_idxs,
-                                 self._discrete_column_cond_st[target_id]+self._random_choice_prob_index(target_id*np.ones((batch//pad)-col_idxs.size, dtype=int))
+                                 self._discrete_column_cond_st[target_id]+self._random_choice_prob_index(target_id*np.ones((batch//q)-col_idxs.size, dtype=int))
             )
-            col_idxs = np.repeat(np.sort(col_idxs), pad)
+            col_idxs = np.repeat(np.sort(col_idxs), q)
             discrete_column_id, category_id_in_col = self.extract_category(col_idxs, target_id)
         else:
-            # discrete_column_id = np.random.choice(
-            #     np.arange(self._n_discrete_columns), batch)
-            # discrete_column_id = 40*np.ones(batch, dtype=int)  # ND7
-            # discrete_column_id = (target_id)*np.ones(batch, dtype=int)  # target
-            # discrete_column_id = np.repeat(np.sort(np.append(np.arange(16,45), [106])), pad)  # AL's, ID's, ND's (30 total)
-            discrete_column_id = np.repeat(np.sort(np.append(np.arange(19,45), (target_id)*np.ones(4, dtype=int))), pad)  # target and ID's + ND's (26 total)
-            # discrete_column_id = np.repeat(np.sort(np.append(np.arange(19,35), (target_id)*np.ones(14, dtype=int))), pad)  # target, ID's
-            # discrete_column_id = np.repeat(np.concatenate([40*np.ones(batch//(pad*2), dtype=int), (target_id)*np.ones(batch//(pad*2), dtype=int)]), pad)  # ND7 + target
-            # discrete_column_id = np.repeat(np.concatenate([np.sort(np.concatenate([np.arange(16,19), np.arange(35,45), [106]])),
-            #                                                (target_id)*np.ones(batch//(pad*2), dtype=int)]), pad)  # AL's, ND's (15 total) + target
-
+            discrete_column_id = np.random.choice(
+                np.arange(self._n_discrete_columns), batch)
             category_id_in_col = self._random_choice_prob_index(discrete_column_id)
 
         mask[np.arange(batch), discrete_column_id] = 1
